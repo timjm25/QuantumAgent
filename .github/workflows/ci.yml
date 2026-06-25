@@ -1,0 +1,99 @@
+name: QuantumAgent CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ------------------------------------------------------------------ #
+  #  Python backend tests                                                #
+  # ------------------------------------------------------------------ #
+  backend-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Run agent tests
+        run: pytest tests/test_agents.py -v --tb=short --timeout=120
+
+      - name: Run neural tests
+        run: pytest tests/test_neural.py -v --tb=short --timeout=60
+
+      - name: Run workflow tests
+        run: pytest tests/test_workflow.py -v --tb=short --timeout=120
+
+      - name: Coverage report
+        run: |
+          pytest tests/ --cov=backend --cov-report=xml --timeout=180 || true
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ------------------------------------------------------------------ #
+  #  Frontend build check                                                #
+  # ------------------------------------------------------------------ #
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type check
+        working-directory: frontend
+        run: npm run type-check || true
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+
+  # ------------------------------------------------------------------ #
+  #  Docker image build smoke test                                       #
+  # ------------------------------------------------------------------ #
+  docker-build:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -f docker/Dockerfile.backend -t quantumagent-backend:${{ github.sha }} .
+
+      - name: Smoke test backend container
+        run: |
+          docker run -d --name qa-test -p 8000:8000 quantumagent-backend:${{ github.sha }}
+          sleep 10
+          curl -f http://localhost:8000/health || (docker logs qa-test && exit 1)
+          docker stop qa-test
