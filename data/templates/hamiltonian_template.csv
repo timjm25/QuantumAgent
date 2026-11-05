@@ -1,0 +1,6 @@
+molecule,pauli,coeff,basis,n_electrons,nuclear_repulsion,notes
+SAMPLE_H2,II,-1.052373245772859,sto-3g,2,0.7199689944489797,SAMPLE row - H2 at 0.735 A parity-mapped 2-qubit reduced
+SAMPLE_H2,IZ,0.39793742484318045,sto-3g,,,SAMPLE row
+SAMPLE_H2,ZI,-0.39793742484318045,sto-3g,,,SAMPLE row
+SAMPLE_H2,ZZ,-0.01128010425623538,sto-3g,,,SAMPLE row
+SAMPLE_H2,XX,0.18093119978423156,sto-3g,,,SAMPLE row

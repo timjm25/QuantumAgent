@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import os
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -85,6 +86,67 @@ class LiteratureAgent(BaseAgent):
         super().__init__(**kwargs)
         self._paper_cache: Dict[str, Paper] = {}
         self._citation_graph: Dict[str, List[str]] = {}
+        self._library: List[Paper] = []          # user-imported papers (source "local")
+        self._source_errors: List[str] = []
+
+    # ------------------------------------------------------------------ #
+    #  Local library (bring your own papers)                              #
+    # ------------------------------------------------------------------ #
+
+    def load_library(self, rows: List[Dict], source: str = "local") -> int:
+        """Add validated ``papers`` rows (see backend.importers) to the local library."""
+        existing = {p.paper_id for p in self._library}
+        added = 0
+        for r in rows:
+            key = (r.get("doi") or r["title"]).lower()
+            pid = hashlib.md5(key.encode()).hexdigest()[:12]
+            if pid in existing:
+                continue
+            text = " ".join([r["title"], r.get("abstract") or "", " ".join(r.get("keywords") or [])])
+            self._library.append(Paper(
+                paper_id=pid,
+                title=r["title"],
+                authors=list(r.get("authors") or []),
+                abstract=r.get("abstract") or "",
+                published=str(r["year"]),
+                source=source,
+                url=r.get("url") or (f"https://doi.org/{r['doi']}" if r.get("doi") else ""),
+                doi=r.get("doi"),
+                citations=int(r.get("citations") or 0),
+                key_concepts=sorted(set(self._extract_concepts_from_text(text)) | set(r.get("keywords") or [])),
+            ))
+            existing.add(pid)
+            added += 1
+        return added
+
+    def _search_local(self, query: str, max_results: int, library: Optional[List[Paper]] = None) -> List[Paper]:
+        papers = [Paper(**{**p.__dict__}) for p in (self._library if library is None else library)]
+        scored = self._score_relevance(papers, query)
+        return sorted([p for p in scored if p.relevance_score > 0], key=lambda p: -p.relevance_score)[:max_results]
+
+    def _demo_library(self) -> List[Paper]:
+        """Bundled public bibliographic metadata, used only when nothing else answers."""
+        from ..importers import REPO_ROOT, load_rows
+
+        path = REPO_ROOT / "data" / "sample_data" / "papers_demo.csv"
+        if not path.exists():
+            return []
+        tmp = LiteratureAgent.__new__(LiteratureAgent)
+        tmp._library = []
+        LiteratureAgent.load_library(tmp, load_rows("papers", path), source="demo_library")
+        return tmp._library
+
+    @staticmethod
+    def offline() -> bool:
+        return os.getenv("QUANTUMAGENT_OFFLINE", "").strip().lower() in ("1", "true", "yes")
+
+    async def _load_library(self, inp: Dict) -> AgentResult:
+        rows = inp.get("rows") or []
+        if not rows:
+            return AgentResult(success=False, output={"error": "No paper rows supplied (import a papers file)"})
+        added = self.load_library(rows)
+        return AgentResult(success=True, output={"added": added, "library_size": len(self._library)},
+                           reasoning=f"Added {added} paper(s) to the local library.")
 
     async def _execute(self, task_input: Dict[str, Any]) -> AgentResult:
         action = task_input.get("action", "search")
@@ -97,6 +159,7 @@ class LiteratureAgent(BaseAgent):
             "detect_contradictions": self._detect_contradictions,
             "recommend_experiments": self._recommend_experiments,
             "build_citation_network": self._build_citation_network,
+            "load_library": self._load_library,
         }
 
         handler = dispatch.get(action)
@@ -109,28 +172,53 @@ class LiteratureAgent(BaseAgent):
 
     async def _search(self, inp: Dict) -> AgentResult:
         query = inp.get("query", "quantum error correction")
-        sources = inp.get("sources", ["arxiv", "semantic_scholar"])
+        default_sources = (["local"] if self._library else []) + ["arxiv", "semantic_scholar"]
+        sources = inp.get("sources", default_sources)
         max_results = inp.get("max_results", 20)
+        offline = bool(inp.get("offline", False)) or self.offline()
+        self._source_errors = []
+        warnings: List[str] = []
 
         all_papers: List[Paper] = []
+        if "local" in sources:
+            all_papers.extend(self._search_local(query, max_results))
 
         tasks = []
-        if "arxiv" in sources:
-            tasks.append(self._search_arxiv(query, max_results))
-        if "semantic_scholar" in sources:
-            tasks.append(self._search_semantic_scholar(query, max_results // 2))
-        if "pubmed" in sources:
-            tasks.append(self._search_pubmed(query, max_results // 2))
+        remote = [src for src in sources if src in ("arxiv", "semantic_scholar", "pubmed")]
+        if offline and remote:
+            warnings.append(f"Offline mode: skipped {', '.join(remote)}.")
+        else:
+            if "arxiv" in sources:
+                tasks.append(self._search_arxiv(query, max_results))
+            if "semantic_scholar" in sources:
+                tasks.append(self._search_semantic_scholar(query, max(1, max_results // 2)))
+            if "pubmed" in sources:
+                tasks.append(self._search_pubmed(query, max(1, max_results // 2)))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, list):
                 all_papers.extend(result)
+        warnings.extend(self._source_errors)
 
-        # Score relevance
+        used_demo = False
+        if not all_papers:
+            all_papers = self._search_local(query, max_results, library=self._demo_library())
+            used_demo = bool(all_papers)
+            if used_demo:
+                warnings.append("No results from the requested sources; showing matches from the bundled demo "
+                                "library (data/sample_data/papers_demo.csv). Import your own papers for a local library.")
+
+        # Score relevance and de-duplicate by title
         all_papers = self._score_relevance(all_papers, query)
         all_papers.sort(key=lambda p: p.relevance_score, reverse=True)
-        all_papers = all_papers[:max_results]
+        seen, unique = set(), []
+        for p in all_papers:
+            key = p.title.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                unique.append(p)
+        all_papers = unique[:max_results]
 
         # Cache
         for p in all_papers:
@@ -142,20 +230,23 @@ class LiteratureAgent(BaseAgent):
             "papers": [self._paper_to_dict(p) for p in all_papers],
             "top_authors": self._extract_top_authors(all_papers),
             "key_concepts": self._extract_key_concepts(all_papers),
+            "sources_searched": sources if not offline else [s for s in sources if s == "local"],
+            "used_demo_library": used_demo,
         }
 
         return AgentResult(
             success=True,
             output=output,
-            confidence=0.88,
+            confidence=0.88 if not used_demo else 0.5,
             reasoning=f"Searched {', '.join(sources)} for '{query}'. Found {len(all_papers)} relevant papers.",
+            warnings=warnings,
         )
 
     async def _search_arxiv(self, query: str, max_results: int) -> List[Paper]:
         """Query the arXiv API (no key required)."""
         encoded = urllib.parse.quote(query)
         url = (
-            f"http://export.arxiv.org/api/query?"
+            f"https://export.arxiv.org/api/query?"
             f"search_query=all:{encoded}"
             f"&start=0&max_results={max_results}"
             f"&sortBy=relevance&sortOrder=descending"
@@ -167,7 +258,8 @@ class LiteratureAgent(BaseAgent):
             return self._parse_arxiv_response(response.decode())
         except Exception as exc:
             logger.warning("arxiv_search_failed", error=str(exc))
-            return self._mock_arxiv_results(query, max_results)
+            self._source_errors.append(f"arXiv unreachable ({type(exc).__name__}).")
+            return []
 
     def _parse_arxiv_response(self, xml_text: str) -> List[Paper]:
         ns = {"atom": "http://www.w3.org/2005/Atom"}
@@ -202,31 +294,6 @@ class LiteratureAgent(BaseAgent):
             pass
         return papers
 
-    def _mock_arxiv_results(self, query: str, n: int) -> List[Paper]:
-        """Synthetic results used when the arXiv API is unreachable."""
-        mock_titles = [
-            "Variational Quantum Eigensolver with Neural Network Ansatz for Molecular Simulation",
-            "Error-Mitigated Quantum Simulation of Strongly Correlated Materials",
-            "QAOA for Combinatorial Optimisation: Theoretical Bounds and Practical Performance",
-            "Fault-Tolerant Quantum Computing with Surface Codes: A Review",
-            "Quantum Machine Learning: Opportunities and Challenges",
-            "Noise-Resilient Variational Algorithms for Near-Term Quantum Devices",
-            "Quantum Chemistry Beyond Mean-Field: A Quantum Computing Perspective",
-        ]
-        papers = []
-        for i, title in enumerate(mock_titles[:n]):
-            papers.append(Paper(
-                paper_id=hashlib.md5(title.encode()).hexdigest()[:12],
-                title=title,
-                authors=[f"Author{i}_A", f"Author{i}_B", f"Author{i}_C"],
-                abstract=f"This paper studies {query} in the context of {title.lower()}. We demonstrate significant improvements over baseline methods and provide rigorous theoretical analysis.",
-                published=f"2024-{(i % 12) + 1:02d}-15",
-                source="arxiv",
-                url=f"https://arxiv.org/abs/2024.{i:05d}",
-                key_concepts=self._extract_concepts_from_text(title),
-            ))
-        return papers
-
     async def _search_semantic_scholar(self, query: str, max_results: int) -> List[Paper]:
         """Semantic Scholar open API."""
         encoded = urllib.parse.quote(query)
@@ -258,36 +325,47 @@ class LiteratureAgent(BaseAgent):
             return papers
         except Exception as exc:
             logger.warning("semantic_scholar_failed", error=str(exc))
+            self._source_errors.append(f"Semantic Scholar unreachable ({type(exc).__name__}).")
             return []
 
     async def _search_pubmed(self, query: str, max_results: int) -> List[Paper]:
-        encoded = urllib.parse.quote(query)
-        url = (
-            f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?"
-            f"db=pubmed&term={encoded}&retmax={max_results}&retmode=json"
-        )
-        try:
-            import json as _json
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(None, lambda: urllib.request.urlopen(url, timeout=10).read())
-            data = _json.loads(response)
-            ids = data.get("esearchresult", {}).get("idlist", [])
+        """NCBI E-utilities: esearch for IDs, then esummary for titles/authors/DOIs."""
+        import json as _json
 
+        base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+        email = f"&email={urllib.parse.quote(settings.pubmed_email)}" if settings.pubmed_email else ""
+        search_url = f"{base}/esearch.fcgi?db=pubmed&term={urllib.parse.quote(query)}&retmax={max_results}&retmode=json{email}"
+        try:
+            loop = asyncio.get_event_loop()
+            fetch = lambda u: urllib.request.urlopen(u, timeout=10).read()  # noqa: E731
+            data = _json.loads(await loop.run_in_executor(None, fetch, search_url))
+            ids = data.get("esearchresult", {}).get("idlist", [])[:max_results]
+            if not ids:
+                return []
+            summary_url = f"{base}/esummary.fcgi?db=pubmed&id={','.join(ids)}&retmode=json{email}"
+            summ = _json.loads(await loop.run_in_executor(None, fetch, summary_url)).get("result", {})
             papers = []
-            for pmid in ids[:max_results]:
+            for pmid in ids:
+                item = summ.get(pmid, {})
+                doi = next((a.get("value") for a in item.get("articleids", []) if a.get("idtype") == "doi"), None)
+                title = item.get("title", "").strip()
+                if not title:
+                    continue
                 papers.append(Paper(
                     paper_id=f"pm_{pmid}",
-                    title=f"PubMed Article {pmid} on {query}",
-                    authors=["PubMed Author"],
-                    abstract="PubMed abstract placeholder — fetch via efetch for full text.",
-                    published="2024-01-01",
+                    title=title,
+                    authors=[a.get("name", "") for a in item.get("authors", [])[:8]],
+                    abstract="",
+                    published=item.get("pubdate", "")[:10],
                     source="pubmed",
                     url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                    doi=f"10.xxxx/pm{pmid}",
+                    doi=doi,
+                    key_concepts=self._extract_concepts_from_text(title),
                 ))
             return papers
         except Exception as exc:
             logger.warning("pubmed_search_failed", error=str(exc))
+            self._source_errors.append(f"PubMed unreachable ({type(exc).__name__}).")
             return []
 
     async def _summarise_papers(self, inp: Dict) -> AgentResult:
@@ -429,9 +507,9 @@ class LiteratureAgent(BaseAgent):
     # ------------------------------------------------------------------ #
 
     def _score_relevance(self, papers: List[Paper], query: str) -> List[Paper]:
-        query_terms = set(query.lower().split())
+        query_terms = {t for t in query.lower().split() if len(t) > 2 or t.isupper()} or set(query.lower().split())
         for p in papers:
-            text = (p.title + " " + p.abstract).lower()
+            text = (p.title + " " + p.abstract + " " + " ".join(p.key_concepts)).lower()
             term_hits = sum(1 for t in query_terms if t in text)
             p.relevance_score = round(min(1.0, term_hits / max(len(query_terms), 1) * 1.2), 3)
         return papers
@@ -495,4 +573,6 @@ class LiteratureAgent(BaseAgent):
             "url": p.url,
             "relevance_score": p.relevance_score,
             "key_concepts": p.key_concepts[:8],
+            "doi": p.doi,
+            "citations": p.citations,
         }

@@ -259,13 +259,17 @@ class KnowledgeGraphAgent(BaseAgent):
             if candidate_id == node_id:
                 continue
             if candidate.node_type in ("paper", "algorithm", "experiment"):
-                shared_neighbours = len(self._adjacency.get(node_id, set()) & self._adjacency.get(candidate_id, set()))
-                score = shared_neighbours / max(1, len(self._adjacency.get(node_id, set())))
+                a = self._adjacency.get(node_id, set())
+                b = self._adjacency.get(candidate_id, set())
+                shared_neighbours = len(a & b)
+                direct = candidate_id in a
+                # Jaccard overlap of neighbourhoods, plus a bonus for a direct edge
+                score = shared_neighbours / max(1, len(a | b)) + (0.25 if direct else 0.0)
                 recs.append({
                     "node_id": candidate_id,
                     "label": candidate.label,
                     "type": candidate.node_type,
-                    "similarity_score": round(score + np.random.uniform(0, 0.2), 4),
+                    "similarity_score": round(score, 4),
                     "reason": f"Shares {shared_neighbours} common connections",
                 })
 
@@ -284,15 +288,32 @@ class KnowledgeGraphAgent(BaseAgent):
         hypotheses = []
         nodes = [n for n in self._nodes.values() if n.node_type in ("algorithm", "molecule", "hardware")]
 
-        for i in range(min(n_hypotheses, len(nodes))):
-            n1 = nodes[i]
-            n2 = nodes[(i + 2) % len(nodes)]
+        # Candidate links: pairs NOT directly connected. Novelty = no existing edge and few
+        # shared neighbours; feasibility = how well both entities are already supported
+        # (degree) plus shared context (Adamic-Adar-style overlap).
+        pairs = []
+        for i, n1 in enumerate(nodes):
+            for n2 in nodes[i + 1:]:
+                a = self._adjacency.get(n1.node_id, set())
+                b = self._adjacency.get(n2.node_id, set())
+                if n2.node_id in a:
+                    continue
+                shared = a & b
+                overlap = sum(1.0 / np.log(2 + len(self._adjacency.get(z, set()))) for z in shared)
+                support = min(1.0, (len(a) + len(b)) / 10.0)
+                novelty = 0.95 - 0.4 * min(1.0, len(shared) / 3.0)
+                feasibility = 0.35 + 0.35 * support + 0.25 * min(1.0, overlap)
+                pairs.append((feasibility * 0.5 + novelty * 0.5, novelty, feasibility, n1, n2, len(shared)))
+        pairs.sort(key=lambda t: (-t[0], t[3].label, t[4].label))
+
+        for i, (_, novelty, feasibility, n1, n2, n_shared) in enumerate(pairs[:n_hypotheses]):
             hypotheses.append({
                 "hypothesis_id": f"H{i+1:03d}",
                 "statement": f"Combining {n1.label} with {n2.label} will yield improved performance for {domain} applications.",
                 "entities_involved": [n1.node_id, n2.node_id],
-                "novelty_score": round(np.random.uniform(0.5, 0.95), 3),
-                "feasibility_score": round(np.random.uniform(0.4, 0.9), 3),
+                "novelty_score": round(float(novelty), 3),
+                "feasibility_score": round(float(feasibility), 3),
+                "shared_neighbours": n_shared,
                 "testable": True,
                 "suggested_experiment": f"Run comparative study of {n1.label} vs hybrid {n1.label}+{n2.label}",
             })

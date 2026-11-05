@@ -14,9 +14,9 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
 from ..core.config import settings
@@ -35,6 +35,8 @@ from ..agents.knowledge_graph_agent import KnowledgeGraphAgent
 from ..agents.coding_agent import CodingAgent
 from ..agents.publication_agent import PublicationAgent
 from ..orchestrator.workflow import WorkflowEngine, WORKFLOW_TEMPLATES
+from ..importers import ImportValidationError, SCHEMAS, template_path
+from ..data_loader import import_file, load_demo_data, schemas as data_schemas
 
 configure_logging(settings.log_level)
 logger = get_logger(__name__)
@@ -172,6 +174,7 @@ async def run_agent(agent_id: str, payload: Dict[str, Any]):
         "reasoning": result.reasoning,
         "duration_ms": result.duration_ms,
         "supporting_refs": result.supporting_refs,
+        "warnings": result.warnings,
     }
 
 
@@ -286,6 +289,53 @@ async def get_job(job_id: str):
 async def select_backend(payload: Dict[str, Any]):
     result = await AGENT_REGISTRY["hardware_agent"].run({"action": "select_backend", **payload})
     return result.output
+
+
+@app.get("/api/v1/hardware/cloud-status", tags=["hardware"])
+async def cloud_status():
+    result = await AGENT_REGISTRY["hardware_agent"].run({"action": "cloud_status"})
+    return result.output
+
+
+# --------------------------------------------------------------------------- #
+#  Bring-your-own data                                                         #
+# --------------------------------------------------------------------------- #
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+@app.get("/api/v1/data/schemas", tags=["data"])
+async def list_data_schemas():
+    """Column schema for every importable dataset."""
+    return data_schemas()
+
+
+@app.get("/api/v1/data/templates/{kind}", tags=["data"])
+async def download_template(kind: str):
+    if kind not in SCHEMAS:
+        raise HTTPException(404, f"Unknown data kind '{kind}'. Choose one of {sorted(SCHEMAS)}")
+    return FileResponse(template_path(kind), media_type="text/csv", filename=SCHEMAS[kind].template)
+
+
+@app.post("/api/v1/data/import/{kind}", tags=["data"])
+async def import_data(kind: str, file: UploadFile = File(...)):
+    """Upload a CSV / TSV / JSON / XLSX file matching the schema for ``kind``."""
+    if kind not in SCHEMAS:
+        raise HTTPException(404, f"Unknown data kind '{kind}'. Choose one of {sorted(SCHEMAS)}")
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File too large (limit 20 MB)")
+    try:
+        result = await import_file(kind, data, AGENT_REGISTRY, filename=file.filename)
+    except ImportValidationError as exc:
+        return JSONResponse(status_code=422, content={"kind": kind, "errors": exc.errors})
+    return result
+
+
+@app.post("/api/v1/data/demo", tags=["data"])
+async def load_demo():
+    """Load the bundled demo datasets (synthetic curves + public paper metadata)."""
+    return await load_demo_data(AGENT_REGISTRY)
 
 
 # --------------------------------------------------------------------------- #

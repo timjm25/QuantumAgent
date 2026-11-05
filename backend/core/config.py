@@ -8,7 +8,30 @@ import os
 from pathlib import Path
 from typing import List, Optional
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def load_dotenv_into_environ(path: str = ".env") -> None:
+    """Copy KEY=VALUE lines from .env into os.environ (never overriding real env vars).
+
+    pydantic-settings reads .env only into ``Settings``; adapters such as
+    backend/quantum/cloud.py read os.environ, so both see the same values.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv_into_environ()
 
 
 class Settings(BaseSettings):
@@ -48,9 +71,10 @@ class Settings(BaseSettings):
     broker_url: str = "redis://localhost:6379/1"
     result_backend: str = "redis://localhost:6379/2"
 
-    # Claude / LLM backend (Claude 4.x via Anthropic API)
+    # Claude / LLM backend (optional; no agent calls an LLM by default).
+    # The model name comes from ANTHROPIC_MODEL (or LLM_MODEL) and defaults to claude-sonnet-5-5.
     anthropic_api_key: Optional[str] = None
-    llm_model: str = "claude-sonnet-4-6"
+    llm_model: str = Field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL") or "claude-sonnet-5-5")
     llm_max_tokens: int = 8192
     llm_temperature: float = 0.1
 
@@ -61,6 +85,9 @@ class Settings(BaseSettings):
     rigetti_api_key: Optional[str] = None
     aws_braket_region: str = "us-east-1"
     azure_quantum_subscription: Optional[str] = None
+    # Cloud execution is off unless explicitly enabled (see backend/quantum/cloud.py)
+    quantumagent_enable_cloud: bool = False
+    quantumagent_offline: bool = False
 
     # Scientific APIs
     semantic_scholar_key: Optional[str] = None
@@ -95,10 +122,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore",
+        env_ignore_empty=True,  # blank placeholders in .env mean "use the default"
+    )
 
 
 settings = Settings()

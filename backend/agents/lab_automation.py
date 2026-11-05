@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .base import BaseAgent, AgentResult
 from ..core.logging import get_logger
+from ..quantum.characterisation import (
+    FITTERS, FitError, SimulatedTransmon, fit_measurements, optimise_pulse,
+)
+
+FITTABLE = ("T1", "T2", "T2_echo", "RB")
 
 logger = get_logger(__name__)
 
@@ -73,9 +79,28 @@ class LabAutomationAgent(BaseAgent):
         "leakage": "Leakage characterisation via phase randomised benchmarking",
     }
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._measurements: List[Dict] = []          # validated qubit_measurements rows
+        self._devices: Dict[int, SimulatedTransmon] = {}
+        self._last_characterisation: Dict[int, Dict] = {}
+
+    def load_measurements(self, rows: List[Dict]) -> Dict:
+        """Add validated ``qubit_measurements`` rows (see backend.importers)."""
+        self._measurements.extend(rows)
+        qubits = sorted({int(r["qubit_id"]) for r in self._measurements})
+        return {"n_rows": len(self._measurements), "qubits": qubits}
+
+    def _device(self, qubit_id: int) -> SimulatedTransmon:
+        if qubit_id not in self._devices:
+            self._devices[qubit_id] = SimulatedTransmon(qubit_id)
+        return self._devices[qubit_id]
+
     async def _execute(self, task_input: Dict[str, Any]) -> AgentResult:
         action = task_input.get("action", "parse_intent")
         dispatch = {
+            "load_measurements": self._load_measurements,
+            "fit_measurements": self._fit_all,
             "parse_intent": self._parse_and_plan,
             "calibrate_qubit": self._calibrate_qubit,
             "characterise": self._characterise_qubit,
@@ -112,32 +137,65 @@ class LabAutomationAgent(BaseAgent):
             reasoning=f"Parsed intent '{intent[:60]}...' and generated {len(protocol['steps'])}-step protocol.",
         )
 
+    async def _load_measurements(self, inp: Dict) -> AgentResult:
+        rows = inp.get("rows") or []
+        if not rows:
+            return AgentResult(success=False, output={"error": "No measurement rows supplied"})
+        info = self.load_measurements(rows)
+        return AgentResult(success=True, output=info,
+                           reasoning=f"Loaded {len(rows)} measurement points for qubits {info['qubits']}.")
+
+    async def _fit_all(self, inp: Dict) -> AgentResult:
+        rows = inp.get("rows") or self._measurements
+        if not rows:
+            return AgentResult(success=False, output={"error": "No measurement data loaded (import a qubit_measurements file)"})
+        fits = fit_measurements(rows)
+        table = [self._summarise_fits(q, f, "measured_data") for q, f in fits.items()]
+        return AgentResult(success=True, output={"qubits": table, "fits": fits}, confidence=0.95)
+
+    @staticmethod
+    def _summarise_fits(qubit_id: int, fits: Dict[str, Dict], source: str) -> Dict:
+        return {
+            "qubit_id": qubit_id,
+            "T1_us": fits.get("T1", {}).get("value"),
+            "T2_us": fits.get("T2", {}).get("value"),
+            "T2_echo_us": fits.get("T2_echo", {}).get("value"),
+            "gate_fidelity": fits.get("RB", {}).get("average_gate_fidelity"),
+            "data_source": source,
+        }
+
     async def _calibrate_qubit(self, inp: Dict) -> AgentResult:
+        """Sequential calibration against the simulated transmon (no instrument connected).
+
+        Each step does a 1-D scan of one pulse parameter around the current value
+        and keeps the best measured fidelity.
+        """
         qubit_id = inp.get("qubit_id", 0)
         target_fidelity = inp.get("target_fidelity", 0.999)
-        protocol_type = inp.get("protocol", "full")
+        dev = self._device(qubit_id)
+        params = {"amplitude": 0.5, "drag_beta": 0.0, "frequency_offset_MHz": 0.0}
 
-        steps = []
         calibration_sequence = [
-            ("Frequency calibration", "spectroscopy", {"sweep_GHz": [4.5, 5.5], "points": 1000}),
-            ("Rabi oscillation", "rabi", {"amp_range": [0, 0.5], "points": 200}),
-            ("DRAG coefficient", "drag_cal", {"beta_range": [-3, 3], "points": 100}),
-            ("Fine frequency via Ramsey", "ramsey", {"detuning_MHz": 1.0, "n_points": 100}),
-            ("Readout optimisation", "readout_cal", {"threshold_scan": True}),
-            ("T1 measurement", "t1", {"max_delay_us": 500, "n_points": 100}),
-            ("T2 Ramsey", "t2", {"max_delay_us": 200, "n_points": 100}),
-            ("Single-qubit RB", "rb", {"max_cliffords": 1000, "n_circuits": 50}),
+            ("Fine frequency via Ramsey", "ramsey", "frequency_offset_MHz", np.linspace(-0.5, 0.5, 41)),
+            ("Rabi amplitude", "rabi", "amplitude", np.linspace(0.35, 0.65, 61)),
+            ("DRAG coefficient", "drag_cal", "drag_beta", np.linspace(-2.0, 2.0, 41)),
+            ("Rabi amplitude (fine)", "rabi_fine", "amplitude", None),
         ]
 
-        current_fidelity = 0.985
-        for name, cmd, params in calibration_sequence:
-            improvement = np.random.uniform(0.0001, 0.003)
-            current_fidelity = min(target_fidelity + 0.0001, current_fidelity + improvement)
+        steps = []
+        current_fidelity = 1 - dev.gate_error(**params)
+        for name, cmd, key, grid in calibration_sequence:
+            if grid is None:
+                grid = np.linspace(params[key] - 0.01, params[key] + 0.01, 41)
+            scores = [dev.measure_gate_fidelity({**params, key: float(v)}) for v in grid]
+            params[key] = float(grid[int(np.argmax(scores))])
+            current_fidelity = 1 - dev.gate_error(**params)
             steps.append({
                 "step": name,
                 "command": cmd,
-                "params": params,
-                "result_fidelity": round(current_fidelity, 5),
+                "params": {"scan": key, "range": [round(float(grid[0]), 4), round(float(grid[-1]), 4)],
+                           "points": len(grid), "best": round(params[key], 5)},
+                "result_fidelity": round(current_fidelity, 6),
                 "converged": current_fidelity >= target_fidelity,
             })
             if current_fidelity >= target_fidelity:
@@ -146,26 +204,63 @@ class LabAutomationAgent(BaseAgent):
         result = {
             "qubit_id": qubit_id,
             "target_fidelity": target_fidelity,
-            "achieved_fidelity": round(current_fidelity, 5),
+            "achieved_fidelity": round(current_fidelity, 6),
+            "coherence_limit": round(1 - dev.coherence_limited_error, 6),
             "n_calibration_steps": len(steps),
             "converged": current_fidelity >= target_fidelity,
+            "calibrated_params": {k: round(v, 5) for k, v in params.items()},
             "calibration_steps": steps,
+            "data_source": "simulated_device",
         }
 
         return AgentResult(
             success=True,
             output=result,
-            confidence=0.91,
+            confidence=0.9,
             reasoning=f"Calibrated qubit {qubit_id}. Achieved fidelity {current_fidelity:.5f} (target {target_fidelity}).",
+            warnings=["Ran against the built-in simulated transmon; connect instrument drivers for a real device."],
         )
 
     async def _characterise_qubit(self, inp: Dict) -> AgentResult:
-        qubit_id = inp.get("qubit_id", 0)
-        measurements = inp.get("measurements", list(self.CHARACTERISATION_PROTOCOLS.keys()))
+        """Fit T1/T2/T2_echo/RB curves.
 
-        results = {}
-        for m in measurements[:6]:
-            results[m] = self._simulate_characterisation(m, qubit_id)
+        Data priority: ``data`` rows in the request, then rows loaded with
+        ``load_measurements``, then curves from the simulated device (labelled).
+        """
+        qubit_id = int(inp.get("qubit_id", 0))
+        measurements = inp.get("measurements", list(self.CHARACTERISATION_PROTOCOLS.keys()))
+        rows = [r for r in (inp.get("data") or self._measurements) if int(r["qubit_id"]) == qubit_id]
+
+        results: Dict[str, Dict] = {}
+        sources = set()
+        if rows:
+            measured = fit_measurements(rows).get(qubit_id, {})
+            for m in measurements:
+                if m in measured:
+                    results[m] = {**measured[m], "data_source": "measured_data"}
+                    sources.add("measured_data")
+        dev = self._device(qubit_id)
+        for m in measurements:
+            if m in results:
+                continue
+            if m in FITTABLE and not rows:
+                x, y = dev.curve(m)
+                try:
+                    results[m] = {**FITTERS[m](x, y), "data_source": "simulated_device"}
+                except FitError as exc:
+                    results[m] = {"error": str(exc)}
+                sources.add("simulated_device")
+            elif m == "readout" and not rows:
+                p0, p1 = dev.readout
+                results[m] = {"fidelity": round((p0 + p1) / 2, 5), "assignment_error": round(1 - (p0 + p1) / 2, 5),
+                              "data_source": "simulated_device"}
+                sources.add("simulated_device")
+            else:
+                results[m] = {"value": None, "status": "not measured (no data for this protocol)"}
+
+        for r in results.values():  # keep the old 'value' key for RB consumers
+            if "average_gate_fidelity" in r:
+                r.setdefault("value", r["average_gate_fidelity"])
 
         summary = {
             "qubit_id": qubit_id,
@@ -174,14 +269,18 @@ class LabAutomationAgent(BaseAgent):
             "T2_echo_us": results.get("T2_echo", {}).get("value"),
             "gate_fidelity": results.get("RB", {}).get("average_gate_fidelity"),
             "readout_fidelity": results.get("readout", {}).get("fidelity"),
+            "data_source": "+".join(sorted(sources)) or "none",
             "full_results": results,
         }
+        self._last_characterisation[qubit_id] = summary
 
         return AgentResult(
             success=True,
             output=summary,
-            confidence=0.93,
+            confidence=0.95 if "measured_data" in sources else 0.6,
             reasoning=f"Characterised qubit {qubit_id} across {len(results)} metrics.",
+            warnings=[] if "simulated_device" not in sources else
+            ["Some results come from the built-in simulated transmon; import qubit_measurements for real data."],
         )
 
     async def _run_closed_loop(self, inp: Dict) -> AgentResult:
@@ -189,39 +288,25 @@ class LabAutomationAgent(BaseAgent):
         qubit_id = inp.get("qubit_id", 0)
         max_iterations = inp.get("max_iterations", 50)
         target = inp.get("target", 0.9995)
+        start = inp.get("initial_params", {"drag_beta": 0.0, "amplitude": 0.5, "frequency_offset_MHz": 0.0})
 
-        history = []
-        current = 0.987
-        params = {"drag_beta": 0.0, "amplitude": 0.5, "frequency_offset_MHz": 0.0}
-
-        for iteration in range(max_iterations):
-            for k in params:
-                params[k] += np.random.randn() * 0.01
-            improvement = np.random.uniform(0.0, 0.001)
-            current = min(target + 0.0001, current + improvement)
-            history.append({
-                "iteration": iteration + 1,
-                "objective": round(current, 6),
-                "params": {k: round(v, 5) for k, v in params.items()},
-                "converged": current >= target,
-            })
-            if current >= target:
-                break
+        dev = self._device(qubit_id)
+        res = optimise_pulse(dev, start, max_iterations=max_iterations, target_fidelity=target)
+        warnings = ["Optimised against the built-in simulated transmon (Nelder-Mead on measured fidelity)."]
+        if target > res["coherence_limit"]:
+            warnings.append(f"Target {target} is above this qubit's coherence limit {res['coherence_limit']}.")
 
         return AgentResult(
             success=True,
             output={
                 "qubit_id": qubit_id,
                 "objective": objective,
-                "initial_value": 0.987,
-                "final_value": round(current, 6),
                 "target": target,
-                "converged": current >= target,
-                "total_iterations": len(history),
-                "optimal_params": {k: round(v, 5) for k, v in params.items()},
-                "convergence_history": history[-10:],
+                "data_source": "simulated_device",
+                **res,
             },
             confidence=0.89,
+            warnings=warnings,
         )
 
     async def _schedule_experiments(self, inp: Dict) -> AgentResult:
@@ -259,24 +344,43 @@ class LabAutomationAgent(BaseAgent):
 
     async def _generate_report(self, inp: Dict) -> AgentResult:
         experiment_id = inp.get("experiment_id", "exp_001")
-        results = inp.get("results", {})
+        qubit_id = inp.get("qubit_id")
+        results = dict(inp.get("results") or {})
+        if not results and self._last_characterisation:
+            qid = qubit_id if qubit_id in self._last_characterisation else next(iter(self._last_characterisation))
+            results = self._last_characterisation[qid]
+        if not results:
+            return AgentResult(success=False, output={
+                "error": "No results to report: pass 'results' or run 'characterise' first"})
 
+        metrics = {k: results.get(k) for k in ("T1_us", "T2_us", "T2_echo_us", "gate_fidelity", "readout_fidelity")
+                   if results.get(k) is not None}
+        recs = []
+        t1, t2 = metrics.get("T1_us"), metrics.get("T2_us")
+        if t1 and t2 and t2 < 0.5 * t1:
+            recs.append(f"T2 ({t2:.1f} us) is well below T1 ({t1:.1f} us): check for low-frequency/flux noise or "
+                        "add dynamical decoupling.")
+        if t1 and t2 and t2 > 2 * t1 * 1.05:
+            recs.append("T2 exceeds 2*T1, which is unphysical: re-check the Ramsey fit and detuning.")
+        gf = metrics.get("gate_fidelity")
+        if gf is not None and gf < 0.999:
+            recs.append(f"Single-qubit gate fidelity {gf:.5f} is below 0.999: rerun amplitude/DRAG calibration.")
+        rf = metrics.get("readout_fidelity")
+        if rf is not None and rf < 0.97:
+            recs.append(f"Readout fidelity {rf:.4f} is below 0.97: re-optimise readout frequency/power and threshold.")
+        if not recs:
+            recs.append("All tracked metrics are within typical thresholds; keep weekly T1/T2 tracking.")
+
+        summary_bits = [f"{k}={v}" for k, v in metrics.items()]
         report = {
             "experiment_id": experiment_id,
             "report_type": "calibration_summary",
-            "generated_at": "2026-06-25T00:00:00Z",
-            "executive_summary": "Calibration sequence completed successfully. Qubit fidelity improved by 0.8% over 12 iterations.",
-            "key_metrics": {
-                "T1_us": results.get("T1_us", 125.3),
-                "T2_us": results.get("T2_us", 87.6),
-                "gate_fidelity": results.get("gate_fidelity", 0.9993),
-            },
-            "recommendations": [
-                "Increase DRAG calibration frequency (drift detected on Q2)",
-                "Schedule weekly T1/T2 tracking",
-                "Enable real-time recalibration for long experiments",
-            ],
-            "figures": ["T1_decay_curve", "ramsey_fringes", "rb_decay_curve", "calibration_timeline"],
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "data_source": results.get("data_source", "user_supplied"),
+            "executive_summary": "Characterisation results: " + (", ".join(summary_bits) or "no metrics") + ".",
+            "key_metrics": metrics,
+            "recommendations": recs,
+            "figures": ["T1_decay_curve", "ramsey_fringes", "rb_decay_curve"],
         }
 
         return AgentResult(success=True, output=report, confidence=0.92)
@@ -337,24 +441,3 @@ class LabAutomationAgent(BaseAgent):
             "steps": steps,
             "hardware": ["AWG", "ADC", "VNA", "qubit_controller"],
         }
-
-    def _simulate_characterisation(self, measurement: str, qubit_id: int) -> Dict:
-        np.random.seed(qubit_id * 100 + hash(measurement) % 100)
-        results = {
-            "T1": {"value": round(np.random.uniform(80, 200), 1), "unit": "μs", "fit_quality": 0.998},
-            "T2": {"value": round(np.random.uniform(40, 120), 1), "unit": "μs", "fit_quality": 0.995},
-            "T2_echo": {"value": round(np.random.uniform(60, 180), 1), "unit": "μs", "fit_quality": 0.996},
-            "RB": {
-                "average_gate_fidelity": round(np.random.uniform(0.998, 0.9995), 5),
-                "error_per_clifford": round(np.random.uniform(0.0005, 0.002), 5),
-                "fit_quality": 0.999,
-            },
-            "readout": {
-                "fidelity": round(np.random.uniform(0.990, 0.999), 4),
-                "assignment_error": round(np.random.uniform(0.001, 0.01), 4),
-            },
-            "cross_talk": {"max_cross_talk": round(np.random.uniform(0.001, 0.02), 4)},
-            "leakage": {"leakage_rate": round(np.random.uniform(0.0001, 0.001), 5)},
-            "gate_set": {"process_fidelity": round(np.random.uniform(0.996, 0.999), 4)},
-        }
-        return results.get(measurement, {"value": None})

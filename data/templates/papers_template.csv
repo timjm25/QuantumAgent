@@ -1,0 +1,3 @@
+title,authors,year,abstract,doi,url,venue,keywords,citations
+A variational eigenvalue solver on a photonic quantum processor,Peruzzo A; McClean J; Shadbolt P; Yung M-H; Zhou X-Q; Love PJ; Aspuru-Guzik A; O'Brien JL,2014,SAMPLE row - first experimental demonstration of the variational quantum eigensolver (VQE).,10.1038/ncomms5213,,Nature Communications,VQE; variational; quantum chemistry; photonic,
+Quantum Computing in the NISQ era and beyond,Preskill J,2018,SAMPLE row - perspective on noisy intermediate-scale quantum devices and their near-term uses.,10.22331/q-2018-08-06-79,,Quantum,NISQ; error correction; quantum advantage,

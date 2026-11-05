@@ -11,7 +11,7 @@ from backend.agents.circuit_designer import CircuitDesignerAgent
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 MINIMAL_REGISTRY = {

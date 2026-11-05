@@ -11,6 +11,9 @@ Every recommendation produced by the platform is accompanied by:
 """
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -239,7 +242,7 @@ class ExplainabilityAgent(BaseAgent):
         audit_trail = {
             "decision_id": decision_id,
             "agent": agent_id,
-            "timestamp": "2026-06-25T00:00:00Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "inputs": decision.get("inputs", {}),
             "outputs": decision.get("outputs", {}),
             "reasoning_chain": [
@@ -250,7 +253,10 @@ class ExplainabilityAgent(BaseAgent):
             ],
             "confidence": decision.get("confidence", 0.88),
             "human_override_required": False,
-            "audit_hash": "sha256:placeholder",
+            "audit_hash": "sha256:" + hashlib.sha256(
+                json.dumps({"decision_id": decision_id, "agent": agent_id, "inputs": decision.get("inputs", {}),
+                            "outputs": decision.get("outputs", {})}, sort_keys=True, default=str).encode()
+            ).hexdigest(),
             "compliant_with": ["MiFID II Art. 25 (if financial)", "EU AI Act transparency requirements"],
         }
 
@@ -282,7 +288,8 @@ class ExplainabilityAgent(BaseAgent):
             "score": score,
             "grade": self._grade_confidence(score),
             "epistemic_uncertainty": round(1 - score, 3),
-            "aleatoric_uncertainty": round(np.random.uniform(0.02, 0.08), 3),
+            # shot-noise floor if the recommendation states its shot count, else a nominal 5%
+            "aleatoric_uncertainty": round(min(0.5, 1 / np.sqrt(float(rec["shots"]))) if rec.get("shots") else 0.05, 3),
         }
 
     def _get_references(self, rec_type: str) -> List[Dict]:
