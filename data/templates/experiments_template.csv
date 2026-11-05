@@ -1,0 +1,4 @@
+name,scientific_value,success_probability,cost_usd,estimated_hours,hardware
+SAMPLE - H2 VQE on simulator,0.4,0.95,0,0.5,local_simulator
+SAMPLE - T1/T2 tracking week 1,0.6,0.9,2000,3,SAMPLE_lab_chip
+SAMPLE - LiH VQE with error mitigation,0.85,0.5,12000,6,ibm_quantum

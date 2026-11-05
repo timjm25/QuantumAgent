@@ -1,0 +1,3 @@
+hypothesis_id,statement,novelty,feasibility,impact,est_cost_usd,est_weeks
+SAMPLE-H1,SAMPLE row - A hardware-efficient ansatz with 2 layers reaches chemical accuracy for H2 on a simulator,0.3,0.95,0.4,500,2
+SAMPLE-H2,SAMPLE row - Zero-noise extrapolation halves the VQE energy error for LiH on a 7-qubit device,,,,15000,12
