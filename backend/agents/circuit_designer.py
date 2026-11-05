@@ -176,6 +176,11 @@ class CircuitDesignerAgent(BaseAgent):
 
     async def _execute(self, task_input: Dict[str, Any]) -> AgentResult:
         action = task_input.get("action", "design_vqe")
+        if "circuit_id" not in task_input:  # in a workflow, use the circuit an upstream step built
+            for out in (task_input.get("_previous_outputs") or {}).values():
+                if isinstance(out, dict) and out.get("circuit_id") in self._circuit_library:
+                    task_input = {**task_input, "circuit_id": out["circuit_id"]}
+                    break
         dispatch = {
             "design_vqe": self._design_vqe,
             "design_qaoa": self._design_qaoa,
@@ -185,6 +190,7 @@ class CircuitDesignerAgent(BaseAgent):
             "transpile": self._transpile_circuit,
             "generate_code": self._generate_code,
             "analyse": self._analyse_circuit,
+            "simulate": self._simulate_circuit,
         }
         handler = dispatch.get(action)
         if handler is None:
@@ -395,6 +401,31 @@ class CircuitDesignerAgent(BaseAgent):
             success=True,
             output={"framework": framework, "code": code_map.get(framework, circuit.to_qasm3())},
             confidence=0.95,
+        )
+
+    async def _simulate_circuit(self, inp: Dict) -> AgentResult:
+        """Run a library circuit on the local state-vector simulator."""
+        from ..quantum.statevector import SimulationError, StatevectorSimulator, circuit_from_gates
+
+        circuit_id = inp.get("circuit_id")
+        circuit = self._circuit_library.get(circuit_id)
+        if circuit is None:
+            return AgentResult(success=False, output={"error": f"Circuit {circuit_id} not found",
+                                                      "known_circuits": list(self._circuit_library)[:20]})
+        shots = int(inp.get("shots", 4096))
+        try:
+            sim = StatevectorSimulator(seed=inp.get("seed"))
+            c = circuit_from_gates(circuit.n_qubits, circuit.gates, circuit.measurements or None)
+            result = sim.run(c, shots)
+        except SimulationError as exc:
+            return AgentResult(success=False, output={"error": str(exc)})
+        top = sorted(result["probabilities"].items(), key=lambda kv: -kv[1])[:8]
+        return AgentResult(
+            success=True,
+            output={"circuit_id": circuit_id, **result, "probabilities": dict(top),
+                    "most_probable_state": top[0][0] if top else None},
+            confidence=0.99,
+            reasoning=f"Simulated {circuit.n_qubits}-qubit circuit {circuit_id} with {shots} shots (exact state vector).",
         )
 
     async def _analyse_circuit(self, inp: Dict) -> AgentResult:

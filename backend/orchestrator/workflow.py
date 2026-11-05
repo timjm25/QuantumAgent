@@ -208,6 +208,9 @@ class WorkflowEngine:
             while not self._all_done(wf):
                 ready = self._get_ready_tasks(wf)
                 if not ready:
+                    # tasks downstream of a failure can never run: skip them instead of waiting forever
+                    if self._skip_blocked(wf):
+                        continue
                     await asyncio.sleep(0.1)
                     continue
 
@@ -218,12 +221,16 @@ class WorkflowEngine:
 
             wf.status = WorkflowStatus.COMPLETED
             wf.completed_at = datetime.now(timezone.utc).isoformat()
+            failed = {n: t.error for n, t in wf.tasks.items() if t.status == TaskStatus.FAILED}
 
             await self._bus.publish(Event(
                 type=EventType.WORKFLOW_COMPLETED,
                 payload={"workflow_id": workflow_id, "outputs": list(wf.outputs.keys())},
             ))
 
+            if failed:
+                return {"workflow_id": workflow_id, "status": "completed_with_errors",
+                        "failed_tasks": failed, "outputs": wf.outputs}
             return {"workflow_id": workflow_id, "status": "completed", "outputs": wf.outputs}
 
         except Exception as exc:
@@ -276,7 +283,7 @@ class WorkflowEngine:
                 wf.outputs[task_name] = result.output
             else:
                 task.status = TaskStatus.FAILED
-                task.error = result.reasoning
+                task.error = result.output.get("error") or result.reasoning
         except asyncio.TimeoutError:
             task.status = TaskStatus.FAILED
             task.error = f"Task timed out after {task.timeout_s}s"
@@ -299,6 +306,20 @@ class WorkflowEngine:
             if deps_done:
                 ready.append(name)
         return ready
+
+    def _skip_blocked(self, wf: Workflow) -> bool:
+        """Mark pending tasks whose dependency failed (or was skipped because of one) as SKIPPED."""
+        changed = False
+        for name, task in wf.tasks.items():
+            if task.status != TaskStatus.PENDING:
+                continue
+            bad = [d for d in task.dependencies if d in wf.tasks and wf.tasks[d].status == TaskStatus.FAILED
+                   or (d in wf.tasks and wf.tasks[d].status == TaskStatus.SKIPPED and wf.tasks[d].error)]
+            if bad:
+                task.status = TaskStatus.SKIPPED
+                task.error = f"skipped: upstream task(s) {', '.join(bad)} did not complete"
+                changed = True
+        return changed
 
     def _all_done(self, wf: Workflow) -> bool:
         return all(

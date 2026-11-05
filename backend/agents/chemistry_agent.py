@@ -13,6 +13,7 @@ Automates:
 from __future__ import annotations
 
 import math
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +23,19 @@ import torch.nn as nn
 
 from .base import BaseAgent, AgentResult
 from ..core.logging import get_logger
+from ..quantum.pauli import BUILTIN_HAMILTONIANS, EXACT_DIAG_MAX_QUBITS, PauliHamiltonian, builtin_hamiltonian
+from ..quantum.vqe import HARTREE_TO_KCAL, SUPPORTED_OPTIMISERS, run_vqe
+
+SYNTHETIC_WARNING = (
+    "No qubit Hamiltonian is available for {mol}/{basis}: numbers are a SYNTHETIC placeholder "
+    "(random integrals, surrogate convergence), not a simulation. Import a Pauli Hamiltonian "
+    "(data/templates/hamiltonian_template.csv) to run a real VQE."
+)
+
+
+def _stable_rng(*parts: str) -> np.random.Generator:
+    """Deterministic RNG (Python's hash() is salted per process)."""
+    return np.random.default_rng(zlib.crc32("|".join(parts).encode()))
 
 logger = get_logger(__name__)
 
@@ -72,6 +86,8 @@ class HamiltonianData:
     hf_energy: Optional[float] = None
     qubit_op_terms: int = 0
     encoding: str = "jordan_wigner"
+    pauli: Optional[PauliHamiltonian] = None   # set when a real qubit Hamiltonian is available
+    source: str = "synthetic_placeholder"
 
 
 class MolPropertyPredictor(nn.Module):
@@ -138,6 +154,73 @@ class QuantumChemistryAgent(BaseAgent):
         self.property_predictor = MolPropertyPredictor()
         self._hamiltonian_cache: Dict[str, HamiltonianData] = {}
         self._vqe_results: Dict[str, Dict] = {}
+        self._user_hamiltonians: Dict[str, PauliHamiltonian] = {}
+
+    # ------------------------------------------------------------------ #
+    #  Bring-your-own Hamiltonians                                         #
+    # ------------------------------------------------------------------ #
+
+    def register_hamiltonian(self, ham: PauliHamiltonian) -> None:
+        """Make an imported qubit Hamiltonian available under ``ham.name``."""
+        self._user_hamiltonians[ham.name] = ham
+        self._hamiltonian_cache = {k: v for k, v in self._hamiltonian_cache.items()
+                                   if not k.startswith(f"{ham.name}_")}
+
+    async def _load_hamiltonians(self, inp: Dict) -> AgentResult:
+        from ..importers import hamiltonians_from_rows
+
+        rows = inp.get("rows") or []
+        if not rows:
+            return AgentResult(success=False, output={"error": "No Hamiltonian rows supplied"})
+        hams = hamiltonians_from_rows(rows)
+        for h in hams.values():
+            self.register_hamiltonian(h)
+        return AgentResult(success=True, output={"loaded": [h.summary() for h in hams.values()]},
+                           reasoning=f"Loaded {len(hams)} Hamiltonian(s): {', '.join(hams)}")
+
+    async def _list_hamiltonians(self, inp: Dict) -> AgentResult:
+        builtin = [{"name": m, "basis": b, "source": "builtin_reference"} for m, b in BUILTIN_HAMILTONIANS]
+        return AgentResult(success=True, output={
+            "user_imported": [h.summary() for h in self._user_hamiltonians.values()],
+            "builtin": builtin,
+        })
+
+    def _vqe_for(self, ham: "HamiltonianData", inp: Dict) -> Dict:
+        """Real VQE when a Pauli Hamiltonian exists, otherwise the labelled surrogate."""
+        if ham.pauli is None:
+            res = self._classical_vqe_mock(ham, max_iter=int(inp.get("max_iterations", 100)))
+            res["method"] = "surrogate_estimate"
+            return res
+        optimiser = inp.get("optimiser", "COBYLA")
+        if optimiser not in SUPPORTED_OPTIMISERS:
+            raise ValueError(f"optimiser must be one of {SUPPORTED_OPTIMISERS}")
+        r = run_vqe(
+            ham.pauli,
+            layers=int(inp.get("n_layers", inp.get("layers", 2))),
+            optimiser=optimiser,
+            max_iterations=int(inp.get("max_iterations", 500)),
+            shots=inp.get("shots"),
+            seed=int(inp.get("seed", 7)),
+        )
+        d = r.to_dict()
+        return {
+            "energy": d["total_energy"],
+            "electronic_energy": d["energy"],
+            "exact_energy": d["exact_total_energy"],
+            "error_vs_exact_ha": d["error_ha"],
+            "error_vs_exact_kcal": d["error_kcal"],
+            "within_chemical_accuracy": d["within_chemical_accuracy"],
+            "params": d["params"],
+            "iterations": d["iterations"],
+            "n_evaluations": d["n_evaluations"],
+            "converged": d["converged"],
+            "energy_std": 0.0 if not d["shots"] else None,
+            "history": d["history"],
+            "optimiser": d["optimiser"],
+            "ansatz": d["ansatz"],
+            "runtime_s": d["runtime_s"],
+            "method": "vqe_statevector" + (f"_{d['shots']}shots" if d["shots"] else ""),
+        }
 
     async def _execute(self, task_input: Dict[str, Any]) -> AgentResult:
         action = task_input.get("action", "simulate")
@@ -150,6 +233,8 @@ class QuantumChemistryAgent(BaseAgent):
             "reaction_pathway": self._analyse_reaction_pathway,
             "benchmark": self._benchmark_molecule,
             "active_space": self._select_active_space,
+            "load_hamiltonians": self._load_hamiltonians,
+            "list_hamiltonians": self._list_hamiltonians,
         }
         handler = dispatch.get(action)
         if handler is None:
@@ -164,17 +249,25 @@ class QuantumChemistryAgent(BaseAgent):
         method = inp.get("method", "vqe")
 
         ham = await self._get_or_build_hamiltonian(molecule, basis)
-        vqe_result = self._classical_vqe_mock(ham)
+        vqe_result = self._vqe_for(ham, inp)
+        warnings = [] if ham.pauli else [SYNTHETIC_WARNING.format(mol=molecule, basis=basis)]
 
         benchmark = BENCHMARK_ENERGIES.get(molecule)
         error_kcal = None
         if benchmark:
-            error_kcal = abs(vqe_result["energy"] - benchmark) * 627.509  # Hartree → kcal/mol
+            error_kcal = abs(vqe_result["energy"] - benchmark) * HARTREE_TO_KCAL
+
+        if ham.pauli is not None:
+            chem_acc = vqe_result["within_chemical_accuracy"]
+        else:
+            chem_acc = error_kcal is not None and error_kcal < 1.0
 
         result = {
             "molecule": molecule,
             "basis": basis,
             "method": method,
+            "computation": vqe_result["method"],
+            "hamiltonian_source": ham.source,
             "n_qubits": ham.n_qubits,
             "n_electrons": ham.n_electrons,
             "hf_energy": ham.hf_energy,
@@ -182,20 +275,25 @@ class QuantumChemistryAgent(BaseAgent):
             "nuclear_repulsion": ham.nuclear_repulsion,
             "iterations": vqe_result["iterations"],
             "converged": vqe_result["converged"],
-            "chemical_accuracy": error_kcal is not None and error_kcal < 1.0,
+            "chemical_accuracy": chem_acc,
         }
+        if ham.pauli is not None:
+            result["exact_energy_in_basis"] = vqe_result["exact_energy"]
+            result["error_vs_exact_kcal"] = vqe_result["error_vs_exact_kcal"]
         if error_kcal is not None:
             result["error_vs_benchmark_kcal"] = round(error_kcal, 4)
             result["benchmark_energy"] = benchmark
+            result["benchmark_note"] = "CCSD(T)/aug-cc-pVQZ reference (basis-set limit), not the same basis"
 
         return AgentResult(
             success=True,
             output=result,
-            confidence=0.86,
+            confidence=0.95 if ham.pauli is not None else 0.3,
             reasoning=(
-                f"Simulated {molecule} with {basis} basis set using {method.upper()}. "
-                f"Ground state energy: {vqe_result['energy']:.6f} Ha."
+                f"Simulated {molecule} with {basis} basis set using {method.upper()} "
+                f"({vqe_result['method']}). Ground state energy: {vqe_result['energy']:.6f} Ha."
             ),
+            warnings=warnings,
         )
 
     async def _generate_hamiltonian(self, inp: Dict) -> AgentResult:
@@ -220,9 +318,11 @@ class QuantumChemistryAgent(BaseAgent):
                 "one_body_shape": list(ham.one_body_integrals.shape),
                 "two_body_shape": list(ham.two_body_integrals.shape),
                 "qubit_op_sample": self._sample_qubit_op(ham),
+                "hamiltonian_source": ham.source,
             },
-            confidence=0.93,
+            confidence=0.98 if ham.pauli is not None else 0.3,
             reasoning=f"Generated {encoding} Hamiltonian for {molecule}/{basis}.",
+            warnings=[] if ham.pauli else [SYNTHETIC_WARNING.format(mol=molecule, basis=basis)],
         )
 
     async def _run_vqe(self, inp: Dict) -> AgentResult:
@@ -232,24 +332,38 @@ class QuantumChemistryAgent(BaseAgent):
         basis = inp.get("basis", "sto-3g")
 
         ham = await self._get_or_build_hamiltonian(molecule, basis)
-        result = self._classical_vqe_mock(ham, max_iter=max_iterations)
+        try:
+            result = self._vqe_for(ham, {**inp, "max_iterations": max_iterations})
+        except ValueError as exc:
+            return AgentResult(success=False, output={"error": str(exc)})
 
         self._vqe_results[molecule] = result
-
+        output = {
+            "molecule": molecule,
+            "ansatz": ansatz if ham.pauli is None else result["ansatz"],
+            "computation": result["method"],
+            "hamiltonian_source": ham.source,
+            "converged": result["converged"],
+            "iterations": result["iterations"],
+            "final_energy": result["energy"],
+            "energy_std": result.get("energy_std", 0.0001),
+            "optimal_params": result["params"][:8],
+            "n_params": len(result["params"]),
+            "cost_function_calls": result.get("n_evaluations", result["iterations"] * len(result["params"])),
+        }
+        if ham.pauli is not None:
+            output.update({
+                "exact_energy": result["exact_energy"],
+                "error_vs_exact_kcal": result["error_vs_exact_kcal"],
+                "within_chemical_accuracy": result["within_chemical_accuracy"],
+                "optimiser": result["optimiser"],
+                "energy_history": result["history"],
+            })
         return AgentResult(
             success=True,
-            output={
-                "molecule": molecule,
-                "ansatz": ansatz,
-                "converged": result["converged"],
-                "iterations": result["iterations"],
-                "final_energy": result["energy"],
-                "energy_std": result.get("energy_std", 0.0001),
-                "optimal_params": result["params"][:8],
-                "n_params": len(result["params"]),
-                "cost_function_calls": result["iterations"] * len(result["params"]),
-            },
-            confidence=0.88,
+            output=output,
+            confidence=0.95 if ham.pauli is not None else 0.3,
+            warnings=[] if ham.pauli else [SYNTHETIC_WARNING.format(mol=molecule, basis=basis)],
         )
 
     async def _predict_properties(self, inp: Dict) -> AgentResult:
@@ -281,10 +395,21 @@ class QuantumChemistryAgent(BaseAgent):
         reaction = inp.get("reaction", "nitrogen_fixation")
         metal_candidates = inp.get("metals", ["Fe", "Mo", "Ru", "Co", "Ni"])
         constraints = inp.get("constraints", {"max_atoms": 20, "earth_abundant": True})
+        # Optional measured / DFT descriptors per metal:
+        #   {"Fe": {"binding_energy": -1.4, "activation_barrier": 0.9, "selectivity": 0.8}, ...}
+        descriptors: Dict[str, Dict[str, float]] = inp.get("descriptors", {})
+        placeholder_used = []
 
         candidates = []
         for metal in metal_candidates:
-            score = self._score_catalyst(metal, reaction)
+            if metal in descriptors:
+                d = descriptors[metal]
+                score = self._composite_catalyst_score(
+                    float(d["binding_energy"]), float(d["activation_barrier"]), float(d.get("selectivity", 0.75)))
+                score["source"] = "user_descriptors"
+            else:
+                score = self._score_catalyst(metal, reaction)
+                placeholder_used.append(metal)
             candidates.append({
                 "metal": metal,
                 "atomic_number": ATOMIC_NUMBERS.get(metal, 0),
@@ -295,6 +420,7 @@ class QuantumChemistryAgent(BaseAgent):
                 "composite_score": round(score["composite"], 3),
                 "earth_abundant": metal not in ["Ru", "Rh", "Pt", "Pd", "Au", "Ag"],
                 "recommended_experiment": f"DFT + VQE study of {metal} active site binding",
+                "descriptor_source": score["source"],
             })
 
         candidates.sort(key=lambda x: x["composite_score"], reverse=True)
@@ -311,15 +437,33 @@ class QuantumChemistryAgent(BaseAgent):
                     "Experimental synthesis and testing of top 3 candidates",
                 ],
             },
-            confidence=0.78,
+            confidence=0.78 if not placeholder_used else 0.2,
             reasoning=f"Screened {len(candidates)} catalyst candidates for {reaction}.",
+            warnings=[f"No descriptors supplied for {', '.join(placeholder_used)}: their binding energy, barrier and "
+                      "selectivity are deterministic PLACEHOLDERS, not computed values. Pass "
+                      "'descriptors' (from DFT or experiment) to rank real candidates."] if placeholder_used else [],
         )
 
     async def _analyse_reaction_pathway(self, inp: Dict) -> AgentResult:
         reactants = inp.get("reactants", ["N2", "H2"])
         products = inp.get("products", ["NH3"])
+        user_steps = inp.get("steps")  # [{"name": ..., "delta_G": kcal/mol, "delta_H": ..., "barrier": ...}]
 
-        steps = self._generate_pathway_steps(reactants, products)
+        if user_steps:
+            steps = []
+            for i, st in enumerate(user_steps):
+                steps.append({
+                    "step": i + 1, "name": st.get("name", f"Step {i + 1}"),
+                    "delta_G": float(st["delta_G"]), "delta_H": float(st.get("delta_H", st["delta_G"])),
+                    "barrier": float(st.get("barrier", max(0.0, float(st["delta_G"])))),
+                })
+            rds = max(range(len(steps)), key=lambda k: steps[k]["barrier"])
+            for k, st in enumerate(steps):
+                st["is_rate_determining"] = k == rds
+            source = "user_steps"
+        else:
+            steps = self._generate_pathway_steps(reactants, products)
+            source = "placeholder_unvalidated"
 
         return AgentResult(
             success=True,
@@ -327,11 +471,14 @@ class QuantumChemistryAgent(BaseAgent):
                 "reactants": reactants,
                 "products": products,
                 "reaction_steps": steps,
-                "rate_determining_step": steps[-1] if steps else None,
-                "overall_delta_G_kcal": round(sum(s["delta_G"] for s in steps), 2),
+                "rate_determining_step": next((st for st in steps if st.get("is_rate_determining")), steps[-1] if steps else None),
+                "overall_delta_G_kcal": round(sum(st["delta_G"] for st in steps), 2),
                 "recommended_simulation": "VQE for transition state structures",
+                "energetics_source": source,
             },
-            confidence=0.72,
+            confidence=0.72 if source == "user_steps" else 0.2,
+            warnings=[] if source == "user_steps" else [
+                "Step energetics are deterministic PLACEHOLDERS; pass 'steps' with computed delta_G values."],
         )
 
     async def _benchmark_molecule(self, inp: Dict) -> AgentResult:
@@ -339,21 +486,30 @@ class QuantumChemistryAgent(BaseAgent):
         basis = inp.get("basis", "sto-3g")
 
         ham = await self._get_or_build_hamiltonian(molecule, basis)
-        vqe = self._classical_vqe_mock(ham)
+        vqe = self._vqe_for(ham, inp)
         ref = BENCHMARK_ENERGIES.get(molecule)
 
         report = {
             "molecule": molecule,
             "basis": basis,
+            "computation": vqe["method"],
+            "hamiltonian_source": ham.source,
             "hf_energy": ham.hf_energy,
             "vqe_energy": vqe["energy"],
+            "exact_energy_in_basis": vqe.get("exact_energy"),
+            "error_vs_exact_kcal": vqe.get("error_vs_exact_kcal"),
             "ccsd_t_reference": ref,
+            "ccsd_t_reference_note": "CCSD(T)/aug-cc-pVQZ (basis-set limit); differs from a minimal-basis result by basis-set error",
             "error_ha": round(abs(vqe["energy"] - ref), 6) if ref else None,
-            "error_kcal": round(abs(vqe["energy"] - ref) * 627.509, 4) if ref else None,
-            "chemical_accuracy": abs(vqe["energy"] - ref) * 627.509 < 1.0 if ref else None,
+            "error_kcal": round(abs(vqe["energy"] - ref) * HARTREE_TO_KCAL, 4) if ref else None,
+            "chemical_accuracy": (vqe["within_chemical_accuracy"] if ham.pauli is not None
+                                  else (abs(vqe["energy"] - ref) * HARTREE_TO_KCAL < 1.0 if ref else None)),
         }
 
-        return AgentResult(success=True, output=report, confidence=0.91)
+        return AgentResult(
+            success=True, output=report, confidence=0.95 if ham.pauli is not None else 0.3,
+            warnings=[] if ham.pauli else [SYNTHETIC_WARNING.format(mol=molecule, basis=basis)],
+        )
 
     async def _select_active_space(self, inp: Dict) -> AgentResult:
         molecule = inp.get("molecule", "H2O")
@@ -390,9 +546,33 @@ class QuantumChemistryAgent(BaseAgent):
         if key in self._hamiltonian_cache:
             return self._hamiltonian_cache[key]
 
-        ham = self._build_mock_hamiltonian(molecule, basis, encoding)
+        pauli = self._user_hamiltonians.get(molecule) or builtin_hamiltonian(molecule, basis)
+        if pauli is not None:
+            ham = self._from_pauli(pauli, encoding)
+        else:
+            ham = self._build_mock_hamiltonian(molecule, basis, encoding)
         self._hamiltonian_cache[key] = ham
         return ham
+
+    def _from_pauli(self, pauli: PauliHamiltonian, encoding: str) -> HamiltonianData:
+        hf = None
+        if pauli.n_qubits <= EXACT_DIAG_MAX_QUBITS:
+            # lowest-energy computational basis state = best single determinant (HF for a canonical-orbital mapping)
+            hf = round(float(np.min(np.real(np.diag(pauli.to_matrix())))) + pauli.nuclear_repulsion, 8)
+        return HamiltonianData(
+            molecule=pauli.name,
+            n_qubits=pauli.n_qubits,
+            n_electrons=pauli.n_electrons or 0,
+            nuclear_repulsion=pauli.nuclear_repulsion,
+            one_body_integrals=np.zeros((0, 0)),
+            two_body_integrals=np.zeros((0, 0, 0, 0)),
+            fci_energy=None,
+            hf_energy=hf,
+            qubit_op_terms=len(pauli.terms),
+            encoding=pauli.metadata.get("mapping", encoding),
+            pauli=pauli,
+            source=pauli.source,
+        )
 
     def _build_mock_hamiltonian(self, molecule: str, basis: str, encoding: str) -> HamiltonianData:
         geometry = self.STANDARD_GEOMETRIES.get(molecule, [("H", 0.0, 0.0, 0.0), ("H", 0.0, 0.0, 0.735)])
@@ -402,9 +582,10 @@ class QuantumChemistryAgent(BaseAgent):
         n_qubits = 2 * n_orbitals if encoding == "jordan_wigner" else max(4, int(math.log2(n_orbitals) + 1) * 2)
 
         n_so = n_qubits
-        one_body = np.random.randn(n_so, n_so) * 0.5
+        rng = _stable_rng(molecule, basis, encoding)
+        one_body = rng.standard_normal((n_so, n_so)) * 0.5
         one_body = (one_body + one_body.T) / 2
-        two_body = np.random.randn(n_so, n_so, n_so, n_so) * 0.05
+        two_body = rng.standard_normal((n_so, n_so, n_so, n_so)) * 0.05
         two_body = (two_body + two_body.transpose(1, 0, 2, 3)) / 2
 
         nuclear_repulsion = sum(
@@ -430,13 +611,16 @@ class QuantumChemistryAgent(BaseAgent):
         )
 
     def _classical_vqe_mock(self, ham: HamiltonianData, max_iter: int = 100) -> Dict:
+        """Surrogate used ONLY when no qubit Hamiltonian exists: relaxes the HF guess
+        toward the tabulated reference. It is not a simulation (see SYNTHETIC_WARNING)."""
         ref = ham.fci_energy or -1.0
         n_params = ham.n_qubits * 2
-        params = np.random.randn(n_params) * 0.1
+        rng = _stable_rng(ham.molecule, "surrogate")
+        params = rng.standard_normal(n_params) * 0.1
 
         energy = ham.hf_energy or -1.0
         for i in range(max_iter):
-            gradient = np.random.randn(n_params) * 0.01
+            gradient = rng.standard_normal(n_params) * 0.01
             params -= 0.1 * gradient
             energy = energy * 0.999 + ref * 0.001
             if abs(energy - ref) < 1e-6:
@@ -451,32 +635,42 @@ class QuantumChemistryAgent(BaseAgent):
         }
 
     def _sample_qubit_op(self, ham: HamiltonianData) -> List[str]:
+        if ham.pauli is not None:
+            return ham.pauli.summary()["largest_terms"][:5]
         n = ham.n_qubits
         sample_terms = []
         paulis = ["I", "X", "Y", "Z"]
+        rng = _stable_rng(ham.molecule, "terms")
         for _ in range(5):
-            term = " ".join(f"{np.random.choice(paulis)}{i}" for i in range(n))
-            coeff = np.random.randn() * 0.1
+            term = " ".join(f"{rng.choice(paulis)}{i}" for i in range(n))
+            coeff = rng.standard_normal() * 0.1
             sample_terms.append(f"{coeff:.6f} [{term}]")
         return sample_terms
 
-    def _score_catalyst(self, metal: str, reaction: str) -> Dict:
-        np.random.seed(hash(metal + reaction) % 2**31)
-        binding = np.random.uniform(-3.0, -0.5)
-        barrier = np.random.uniform(0.3, 2.5)
-        selectivity = np.random.uniform(0.5, 1.0)
-        composite = selectivity * 0.4 + (1 - (barrier / 2.5)) * 0.4 + (1 - abs(binding + 1.5) / 3) * 0.2
+    @staticmethod
+    def _composite_catalyst_score(binding: float, barrier: float, selectivity: float) -> Dict:
+        """Sabatier-style composite: high selectivity, low barrier, binding near -1.5 eV."""
+        composite = selectivity * 0.4 + (1 - min(barrier, 2.5) / 2.5) * 0.4 + (1 - min(abs(binding + 1.5), 3) / 3) * 0.2
         return {"binding_energy": binding, "activation_barrier": barrier, "selectivity": selectivity, "composite": composite}
+
+    def _score_catalyst(self, metal: str, reaction: str) -> Dict:
+        """Deterministic PLACEHOLDER descriptors (no chemistry behind them)."""
+        rng = _stable_rng(metal, reaction)
+        out = self._composite_catalyst_score(
+            float(rng.uniform(-3.0, -0.5)), float(rng.uniform(0.3, 2.5)), float(rng.uniform(0.5, 1.0)))
+        out["source"] = "placeholder_unvalidated"
+        return out
 
     def _generate_pathway_steps(self, reactants: List[str], products: List[str]) -> List[Dict]:
         intermediates = ["Adsorption complex", "Activated intermediate", "Transition state 1", "Transition state 2"]
         steps = []
+        rng = _stable_rng(*reactants, "->", *products)
         for i, name in enumerate(intermediates):
             steps.append({
                 "step": i + 1,
                 "name": name,
-                "delta_G": round(np.random.randn() * 10, 2),
-                "delta_H": round(np.random.randn() * 12, 2),
+                "delta_G": round(float(rng.standard_normal()) * 10, 2),
+                "delta_H": round(float(rng.standard_normal()) * 12, 2),
                 "is_rate_determining": i == len(intermediates) - 2,
             })
         return steps

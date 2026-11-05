@@ -177,31 +177,96 @@ class PrincipalInvestigatorAgent(BaseAgent):
             ],
         )
 
+    # Transparent keyword cues for hypotheses with no user-supplied scores.
+    # (The HypothesisRanker network above is untrained, so it is not used for scoring.)
+    SCORE_CUES = {
+        "feasibility": {
+            "+": ["simulator", "simulation", "small", "h2", "2-qubit", "two-qubit", "benchmark", "existing", "classical"],
+            "-": ["fault-tolerant", "fault tolerant", "logical qubit", "100 qubits", "1000", "large-scale", "million"],
+        },
+        "novelty": {
+            "+": ["first", "novel", "new", "hybrid", "combining", "unexplored", "never", "adaptive"],
+            "-": ["reproduce", "replicate", "baseline", "known", "standard", "benchmark"],
+        },
+        "impact": {
+            "+": ["chemical accuracy", "advantage", "halves", "order of magnitude", "error correction",
+                  "drug", "catalyst", "scal", "fidelity", "reduce"],
+            "-": ["toy", "minor", "incremental"],
+        },
+    }
+    DEFAULT_HYPOTHESIS_WEIGHTS = {"feasibility": 0.3, "novelty": 0.3, "impact": 0.4}
+
+    def _heuristic_score(self, statement: str, dim: str, est_weeks=None, est_cost=None):
+        text = statement.lower()
+        cues = self.SCORE_CUES[dim]
+        plus = [c for c in cues["+"] if c in text]
+        minus = [c for c in cues["-"] if c in text]
+        score = 0.5 + 0.1 * len(plus) - 0.1 * len(minus)
+        notes = [f"+{c}" for c in plus] + [f"-{c}" for c in minus]
+        if dim == "feasibility":
+            if est_weeks is not None:
+                adj = 0.15 if est_weeks <= 4 else (-0.15 if est_weeks > 26 else 0.0)
+                score += adj
+                if adj:
+                    notes.append(f"{'+' if adj > 0 else '-'}duration {est_weeks}w")
+            if est_cost is not None:
+                adj = 0.1 if est_cost <= 1000 else (-0.1 if est_cost > 50000 else 0.0)
+                score += adj
+                if adj:
+                    notes.append(f"{'+' if adj > 0 else '-'}cost ${est_cost:,.0f}")
+        return float(np.clip(score, 0.05, 0.95)), notes
+
     async def _rank_hypotheses(self, inp: Dict) -> AgentResult:
+        """Rank hypotheses by weighted feasibility / novelty / impact.
+
+        Scores you supply (0-1) are used as-is; missing ones are estimated
+        from transparent keyword cues (see SCORE_CUES) and marked "heuristic".
+        """
         hypotheses = inp.get("hypotheses", [])
         if not hypotheses:
             hypotheses = self._hypotheses
+        weights = {**self.DEFAULT_HYPOTHESIS_WEIGHTS, **(inp.get("weights") or {})}
+        total_w = sum(weights.values()) or 1.0
 
         scored = []
-        for h in hypotheses:
-            emb = torch.randn(1, 8, 256)  # placeholder embedding
-            with torch.no_grad():
-                scores = self.ranker(emb)[0].tolist()
+        n_estimated = 0
+        for i, h in enumerate(hypotheses):
+            statement = h.get("statement") or h.get("hypothesis") or h.get("text") or ""
+            sources, rationale, vals = {}, {}, {}
+            for dim in ("feasibility", "novelty", "impact"):
+                given = h.get(dim)
+                if given is not None and given != "":
+                    vals[dim] = float(given)
+                    sources[dim] = "user"
+                else:
+                    vals[dim], rationale[dim] = self._heuristic_score(
+                        statement, dim, h.get("est_weeks"), h.get("est_cost_usd"))
+                    sources[dim] = "heuristic"
+                    n_estimated += 1
+            composite = sum(vals[d] * weights.get(d, 0) for d in vals) / total_w
             scored.append({
                 **h,
-                "feasibility": round(scores[0], 3),
-                "novelty": round(scores[1], 3),
-                "impact": round(scores[2], 3),
-                "composite_score": round((scores[0] * 0.3 + scores[1] * 0.3 + scores[2] * 0.4), 3),
+                "hypothesis_id": h.get("hypothesis_id") or f"H{i + 1:02d}",
+                "feasibility": round(vals["feasibility"], 3),
+                "novelty": round(vals["novelty"], 3),
+                "impact": round(vals["impact"], 3),
+                "composite_score": round(composite, 3),
+                "score_source": sources,
+                "heuristic_cues": rationale,
             })
 
         scored.sort(key=lambda x: x["composite_score"], reverse=True)
+        for rank, h in enumerate(scored, start=1):
+            h["rank"] = rank
 
         return AgentResult(
             success=True,
-            output={"ranked_hypotheses": scored},
-            confidence=0.75,
-            reasoning=f"Ranked {len(scored)} hypotheses using feasibility × novelty × impact scoring.",
+            output={"ranked_hypotheses": scored, "weights": weights},
+            confidence=0.85 if n_estimated == 0 else 0.6,
+            reasoning=f"Ranked {len(scored)} hypotheses by weighted feasibility, novelty and impact "
+                      f"({n_estimated} score(s) estimated heuristically).",
+            warnings=[] if n_estimated == 0 else
+            ["Some scores were estimated from keyword cues; supply novelty/feasibility/impact for a defensible ranking."],
         )
 
     async def _create_milestone_plan(self, inp: Dict) -> AgentResult:
@@ -269,17 +334,35 @@ class PrincipalInvestigatorAgent(BaseAgent):
         )
 
     async def _prioritise_experiments(self, inp: Dict) -> AgentResult:
+        """Weighted score: scientific value, success probability, low cost, short duration."""
         experiments = inp.get("experiments", [])
-        criteria = inp.get("criteria", ["scientific_value", "cost", "time", "hardware_availability"])
+        weights = {"scientific_value": 0.4, "success_probability": 0.25, "cost": 0.2, "time": 0.15,
+                   **(inp.get("weights") or {})}
+        if not experiments:
+            return AgentResult(success=False, output={"error": "No experiments supplied"})
+
+        costs = [float(e.get("cost_usd") or 0) for e in experiments]
+        hours = [float(e.get("estimated_hours") or 0) for e in experiments]
+        max_cost, max_hours = max(costs) or 1.0, max(hours) or 1.0
+        total_w = sum(weights.values()) or 1.0
 
         prioritised = []
-        for i, exp in enumerate(experiments):
-            score = np.random.uniform(0.4, 0.95)  # replaced by real Bayesian model in prod
+        for exp, c, t in zip(experiments, costs, hours):
+            value = float(exp.get("scientific_value", 0.5) if exp.get("scientific_value") is not None else 0.5)
+            p_success = float(exp.get("success_probability") if exp.get("success_probability") is not None else 0.7)
+            parts = {
+                "scientific_value": value,
+                "success_probability": p_success,
+                "cost": 1 - c / max_cost,
+                "time": 1 - t / max_hours,
+            }
+            score = sum(parts[k] * weights.get(k, 0) for k in parts) / total_w
+            drivers = sorted(parts, key=lambda k: -parts[k] * weights.get(k, 0))[:2]
             prioritised.append({
                 **exp,
                 "priority_score": round(score, 3),
-                "recommended_order": i + 1,
-                "rationale": f"High scientific value, feasible within current hardware constraints.",
+                "score_breakdown": {k: round(v, 3) for k, v in parts.items()},
+                "rationale": "Driven by " + " and ".join(d.replace("_", " ") for d in drivers) + ".",
             })
 
         prioritised.sort(key=lambda x: x["priority_score"], reverse=True)
@@ -288,33 +371,57 @@ class PrincipalInvestigatorAgent(BaseAgent):
 
         return AgentResult(
             success=True,
-            output={"prioritised_experiments": prioritised},
-            confidence=0.80,
+            output={"prioritised_experiments": prioritised, "weights": weights},
+            confidence=0.85,
         )
 
     async def _summarise_progress(self, inp: Dict) -> AgentResult:
+        """Progress from what this agent actually knows: the stored plan, the
+        milestones you mark complete (``completed_milestones``), and its task log."""
         project_id = inp.get("project_id", self.recall("current_project", "unknown"))
         project = self._projects.get(project_id, {})
+        phases = project.get("phases", [])
+        completed = list(inp.get("completed_milestones", []))
+        achievements = list(inp.get("achievements", []))
+        blockers = list(inp.get("blockers", []))
+
+        n_phases = len(phases)
+        completion = round(100.0 * min(len(completed), n_phases) / n_phases, 1) if n_phases else None
+        elapsed = None
+        if project.get("created_at") and project.get("duration_weeks"):
+            started = datetime.fromisoformat(project["created_at"])
+            weeks = (datetime.now(timezone.utc) - started).days / 7
+            elapsed = round(min(100.0, 100.0 * weeks / project["duration_weeks"]), 1)
+
+        if completion is None:
+            status = "no_plan"
+        elif elapsed is not None and completion + 10 < elapsed:
+            status = "behind_schedule"
+        else:
+            status = "on_track"
+
+        done_tasks = [t for t in self._task_history if t.output is not None]
+        next_actions = [p.get("name", str(p)) for p in phases[len(completed):len(completed) + 3]] if phases else \
+            ["Create a research plan (action generate_research_plan)"]
 
         summary = {
             "project_id": project_id,
-            "status": "on_track",
-            "completion_percentage": 35.0,
-            "key_achievements": [
-                "Literature review complete — 147 papers reviewed",
-                "3 hypotheses validated via simulation",
-                "VQE circuit depth reduced by 40%",
-            ],
-            "blockers": ["Waiting for IBM Quantum queue slots", "Molecule dataset curation in progress"],
-            "next_actions": [
-                "Submit hardware job batch to IBM Eagle",
-                "Begin publication draft for H1 results",
-                "Update knowledge graph with new findings",
-            ],
+            "title": project.get("title"),
+            "status": status,
+            "completion_percentage": completion,
+            "schedule_elapsed_pct": elapsed,
+            "n_phases": n_phases,
+            "n_hypotheses": len(project.get("hypotheses", [])),
+            "completed_milestones": completed,
+            "key_achievements": achievements,
+            "blockers": blockers,
+            "next_actions": next_actions,
+            "agent_tasks_completed": len(done_tasks),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        return AgentResult(success=True, output=summary, confidence=0.91)
+        return AgentResult(success=True, output=summary, confidence=0.9 if project else 0.5,
+                           warnings=[] if project else [f"No stored plan for project '{project_id}'."])
 
     # ------------------------------------------------------------------ #
     #  Private helpers                                                     #
