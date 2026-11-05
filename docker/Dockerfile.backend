@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY backend/ ./backend/
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/
+COPY data/templates/ ./data/templates/
+COPY data/sample_data/ ./data/sample_data/
 
 # Non-root user
 RUN useradd -m -u 1000 quantumagent && chown -R quantumagent /app
