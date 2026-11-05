@@ -148,9 +148,9 @@ The platform:
 | 1 | **Principal Investigator** | Research management | Hypothesis ranking with learned scoring model, milestone planning, funding proposals |
 | 2 | **Literature** | Scientific search | Live arXiv/PubMed/Semantic Scholar search, trend detection, contradiction discovery |
 | 3 | **Circuit Designer** | Quantum circuits | VQE/QAOA/QML/QEC circuit synthesis, GRU-based gate optimisation, multi-backend transpilation |
-| 4 | **Quantum Chemistry** | Molecular simulation | Hamiltonian generation (JW/BK), VQE mock + CCSD(T) benchmarking, catalyst design |
+| 4 | **Quantum Chemistry** | Molecular simulation | VQE on built-in or imported Pauli Hamiltonians with exact-diagonalisation check, catalyst screening |
 | 5 | **Lab Automation** | Experiment control | Natural language → calibration protocol, closed-loop T1/T2/gate-fidelity optimisation |
-| 6 | **Hardware Integration** | Backend management | IBM/IonQ/Quantinuum/Rigetti/Braket/Azure/Aer, job submission, backend selection scoring |
+| 6 | **Hardware Integration** | Backend management | Local simulator by default, noise emulation, optional IBM Quantum, backend ranking from calibration data |
 | 7 | **Optimisation** | Parameter search | GP-EI Bayesian opt, CMA-ES, REINFORCE RL, L-BFGS, active learning, pulse optimisation |
 | 8 | **Data Analysis** | Statistical analysis | Quantum state tomography, error characterisation, ECE calibration, benchmark comparison |
 | 9 | **Explainability** | Scientific rationale | Confidence calibration, literature-backed rationale, alternative analysis, risk assessment |
@@ -193,38 +193,127 @@ Update knowledge graph → Generate novel hypotheses
 
 ## Quick Start
 
-### Prerequisites
-```bash
-python 3.10+    # Backend
-node 20+        # Frontend
-docker          # Infrastructure (optional)
-```
+Everything below runs locally with no accounts, API keys or paid services. Quantum
+circuits run on a built-in NumPy state-vector simulator (up to 24 qubits); Qiskit Aer
+is used only if you ask for it and it is installed.
 
-### Install (backend only)
+### 1. Install
+
 ```bash
 git clone https://github.com/timjm25/QuantumAgent
 cd QuantumAgent
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
+cp .env.example .env        # optional: every value in it is a blank placeholder
 ```
 
-### Run the API server
+Python 3.10+ is required. `requirements.txt` also lists heavier packages (torch, qiskit,
+celery, ...) used by the neural layer and optional paths; the core simulator, importers,
+CLI and API need only numpy, scipy, fastapi, pydantic(-settings), python-multipart and httpx.
+
+### 2. Try it on the bundled demo data
+
 ```bash
-uvicorn backend.api.main:app --reload --host 0.0.0.0 --port 8000
-# → Open http://localhost:8000/docs for interactive API
+python3 -m backend.cli demo                     # runs every command below on data/sample_data/
+python3 -m backend.cli vqe --demo               # VQE for H2 (STO-3G); matches exact -1.137306 Ha
+python3 -m backend.cli run-circuit data/sample_data/ghz3_demo.qasm --shots 2000
+python3 -m backend.cli run-circuit data/sample_data/ghz3_demo.qasm --emulate --backend ibm_nairobi
+python3 -m backend.cli fit-qubits data/sample_data/qubit_measurements_demo.csv
 ```
 
-### Run the frontend
+`data/sample_data/` is demo data only: qubit curves and device calibrations come from a
+simulated transmon (`scripts/make_sample_data.py` regenerates them), and `papers_demo.csv`
+holds public bibliographic metadata with short summaries written for this repo (not the
+published abstracts). Nothing in it is real lab or customer data.
+
+### 3. Import your own data
+
+Each dataset has a template in `data/templates/` with the exact columns and two rows
+marked `SAMPLE`. Copy the template, replace the sample rows, then validate and use it.
+CSV, TSV, JSON (list of objects) and Excel `.xlsx` are accepted. Column names are
+case-insensitive and common aliases are accepted (e.g. `t1` for `T1_us`).
+
+| Kind | Template | What it feeds | CLI |
+|------|----------|---------------|-----|
+| `hamiltonian` | `hamiltonian_template.csv` | Chemistry agent VQE / benchmark (Pauli terms from PySCF, OpenFermion or Qiskit Nature) | `vqe --hamiltonian FILE` |
+| `qubit_measurements` | `qubit_measurements_template.csv` | T1, Ramsey T2, T2 echo and RB fits | `fit-qubits FILE` |
+| `device_calibration` | `device_calibration_template.csv` | Registers your device as a backend, ranks backends, noise emulation | `register-device FILE` |
+| `papers` | `papers_template.csv` | Offline literature library (search, trends) | `search-papers FILE "query"` |
+| `hypotheses` | `hypotheses_template.csv` | PI agent hypothesis ranking (your scores or transparent keyword heuristics) | `rank-hypotheses FILE` |
+| `experiments` | `experiments_template.csv` | Weighted experiment prioritisation | `prioritise FILE` |
+
 ```bash
-cd frontend
-npm install
-npm run dev
-# → Open http://localhost:3000
+python3 -m backend.cli schemas                                  # every column, type, range and meaning
+cp data/templates/device_calibration_template.csv my_device.csv  # then edit it
+python3 -m backend.cli validate device_calibration my_device.csv # row-numbered errors, exit code 2 on failure
+python3 -m backend.cli register-device my_device.csv --priority fidelity
+python3 -m backend.cli --json vqe --hamiltonian my_hamiltonian.csv --molecule LiH
 ```
 
-### Docker (full stack with Neo4j + Qdrant + Redis)
+Pauli labels in a Hamiltonian file may be dense (`XZI`, rightmost character is qubit 0,
+Qiskit order) or sparse (`X2 Z0`). Imported data is held in memory by the running
+process; re-import after a restart.
+
+### 4. Run the API (and optional frontend)
+
+```bash
+uvicorn backend.api.main:app --reload --port 8000   # docs at http://localhost:8000/docs
+
+curl http://localhost:8000/api/v1/data/schemas
+curl -O http://localhost:8000/api/v1/data/templates/papers
+curl -F file=@my_papers.csv http://localhost:8000/api/v1/data/import/papers   # 422 + errors if invalid
+curl -X POST http://localhost:8000/api/v1/data/demo                           # load all demo datasets
+
+cd frontend && npm install && npm run dev            # dashboard at http://localhost:3000
+```
+
+### 5. Run the tests
+
+```bash
+python3 -m pytest -q          # 141 tests; network calls are disabled by tests/conftest.py
+cd frontend && npm run type-check && npm run build   # the frontend has no unit tests
+```
+
+### Optional: cloud quantum hardware
+
+Off by default because providers may bill per shot. A job goes to a cloud provider only
+when all of these hold: `QUANTUMAGENT_ENABLE_CLOUD=true`, the provider's credential is set
+in `.env`, and its SDK is installed. Only IBM Quantum has an adapter
+(`pip install qiskit-ibm-runtime`, `IBM_QUANTUM_TOKEN`); IonQ, Quantinuum, Rigetti, AWS
+Braket and Azure Quantum are listed but not implemented. Otherwise a cloud backend name
+returns a clear error and you can run on `local_simulator`, or add `emulate: true`
+(`--emulate`) to simulate that device's published error rates locally.
+`GET /api/v1/hardware/cloud-status` shows what is configured without revealing secrets.
+
+### Optional: Docker
+
 ```bash
 docker compose -f docker/docker-compose.yml up -d
 ```
+
+---
+
+## What is computed vs. placeholder
+
+| Area | Real computation | Placeholder / labelled estimate |
+|------|------------------|----------------------------------|
+| Circuits | State-vector simulation, OpenQASM 2/3 subset parser, sampling, local noise emulation | Native-gate transpilation is simplistic |
+| Chemistry | VQE (RY + CX ansatz, SciPy optimisers) and exact diagonalisation for built-in H2 and any imported Pauli Hamiltonian | Other molecules without an imported Hamiltonian use a synthetic surrogate, flagged `hamiltonian_source: synthetic_placeholder`; catalyst and pathway scores are heuristics unless you pass descriptors / steps |
+| Lab automation | Curve fits for T1, T2, T2 echo and RB; calibration scans and pulse optimisation on a simulated transmon digital twin | No real instrument control |
+| Hardware | Backend ranking from catalogue or your calibration file | Catalogue error rates are static reference values, not live |
+| Literature | Local library search; live arXiv and PubMed when online | Semantic Scholar not wired in |
+| Analysis | Statistics, linear-inversion state tomography, readout error from counts, state / unitary fidelity | Benchmark values without user data are indicative and labelled |
+| PI / KG / explainability | Transparent weighted ranking, graph-structure scoring, sha256 audit hashes | |
+| Neural layer, optimisation and publication agents | Model code runs | Models are untrained; outputs are illustrative |
+
+Every output that is not computed from your data or the simulator says so in its
+`warnings` or a `*_source` field.
+
+### Out of scope for this prototype
+
+- Running on real quantum hardware by default, or any provider other than IBM Quantum
+- Generating molecular Hamiltonians from geometry (needs PySCF / Qiskit Nature: import the Pauli terms instead)
+- Trained GNN / transformer / Bayesian models, and real instrument control
+- Persistence of imported data across restarts, authentication and multi-user access
 
 ---
 
@@ -235,23 +324,17 @@ docker compose -f docker/docker-compose.yml up -d
 ```python
 import asyncio
 from backend.agents.chemistry_agent import QuantumChemistryAgent
-from backend.agents.circuit_designer import CircuitDesignerAgent
+from backend.agents.hardware_agent import HardwareIntegrationAgent
 
 async def main():
     chem = QuantumChemistryAgent()
-    circuit = CircuitDesignerAgent()
+    vqe = await chem.run({"action": "vqe", "molecule": "H2"})
+    print(vqe.output["final_energy"], vqe.output["exact_energy"], vqe.output["within_chemical_accuracy"])
 
-    # 1. Generate Hamiltonian for water
-    h_result = await chem.run({"action": "generate_hamiltonian", "molecule": "H2O", "basis": "sto-3g"})
-    print(f"H2O: {h_result.output['n_qubits']} qubits, {h_result.output['n_electrons']} electrons")
-
-    # 2. Design VQE circuit
-    c_result = await circuit.run({"action": "design_vqe", "n_qubits": h_result.output["n_qubits"]})
-    print(f"Circuit depth: {c_result.output['depth']}, gates: {c_result.output['gate_count']}")
-
-    # 3. Run VQE
-    vqe = await chem.run({"action": "vqe", "molecule": "H2O"})
-    print(f"VQE energy: {vqe.output['final_energy']:.6f} Ha")
+    hw = HardwareIntegrationAgent()
+    qasm = open("data/sample_data/ghz3_demo.qasm").read()
+    job = await hw.run({"action": "submit_job", "qasm": qasm, "shots": 1000})
+    print(job.output["counts"])
 
 asyncio.run(main())
 ```
@@ -259,7 +342,7 @@ asyncio.run(main())
 ### Via REST API
 
 ```bash
-# Search literature
+# Search literature (local library, plus arXiv/PubMed unless QUANTUMAGENT_OFFLINE=1)
 curl -X POST http://localhost:8000/api/v1/literature/search \
   -H "Content-Type: application/json" \
   -d '{"query": "VQE hydrogen molecule", "max_results": 10}'
@@ -273,24 +356,6 @@ curl -X POST http://localhost:8000/api/v1/circuits/design \
 curl -X POST http://localhost:8000/api/v1/workflows \
   -H "Content-Type: application/json" \
   -d '{"template": "quantum_chemistry_vqe", "name": "H2 experiment"}'
-```
-
----
-
-## Running the Tests
-
-```bash
-# All tests
-pytest tests/ -v --tb=short
-
-# Agent tests (34 tests across 12 agents)
-pytest tests/test_agents.py -v
-
-# Neural network tests (20 tests)
-pytest tests/test_neural.py -v
-
-# Workflow engine tests (9 tests)
-pytest tests/test_workflow.py -v
 ```
 
 ---
@@ -320,6 +385,11 @@ QuantumAgent/
 │   │   ├── transformer.py       # Scientific transformer, MoE
 │   │   ├── bayesian.py          # BNN, MC Dropout, Deep Ensemble
 │   │   └── embeddings.py        # Sentence/molecular embedders + VectorStore
+│   ├── quantum/                 # State-vector simulator, QASM parser, Pauli Hamiltonians,
+│   │                            # VQE, qubit curve fits, optional cloud adapters
+│   ├── importers.py             # Dataset schemas + CSV/TSV/JSON/XLSX validation
+│   ├── data_loader.py           # Routes imported data to agents (API + CLI)
+│   ├── cli.py                   # python -m backend.cli ...
 │   ├── orchestrator/
 │   │   └── workflow.py          # DAG engine, checkpoints, approval gates
 │   └── core/
@@ -329,16 +399,18 @@ QuantumAgent/
 ├── frontend/
 │   ├── app/page.tsx             # Research command centre dashboard
 │   └── app/layout.tsx           # Next.js 14 app router layout
-├── tests/
-│   ├── test_agents.py           # 34 agent tests
-│   ├── test_neural.py           # 20 neural tests
-│   └── test_workflow.py         # 9 workflow tests
+├── data/
+│   ├── templates/               # One template CSV per importable dataset
+│   └── sample_data/             # Synthetic / public demo data
+├── scripts/make_sample_data.py  # Regenerates data/sample_data/
+├── tests/                       # 141 tests (python3 -m pytest -q)
 ├── docker/
 │   ├── docker-compose.yml       # Full stack (API + frontend + Redis + Neo4j + Qdrant)
 │   ├── Dockerfile.backend
 │   └── Dockerfile.frontend
 ├── .github/workflows/ci.yml     # CI: Python 3.10/3.11 matrix tests + Docker build
 ├── requirements.txt
+├── .env.example                 # Placeholders only
 ├── LICENSE                      # MIT
 └── README.md
 ```
@@ -356,7 +428,8 @@ Full interactive documentation at `http://localhost:8000/docs` (Swagger UI).
 | Literature | `POST /api/v1/literature/search` · `POST /api/v1/literature/trends` |
 | Circuits | `POST /api/v1/circuits/design` · `POST /api/v1/circuits/{id}/optimise` |
 | Chemistry | `POST /api/v1/chemistry/simulate` · `POST /api/v1/chemistry/catalyst` |
-| Hardware | `GET /api/v1/hardware/backends` · `POST /api/v1/hardware/jobs` |
+| Hardware | `GET /api/v1/hardware/backends` · `POST /api/v1/hardware/jobs` · `GET /api/v1/hardware/cloud-status` |
+| Data | `GET /api/v1/data/schemas` · `GET /api/v1/data/templates/{kind}` · `POST /api/v1/data/import/{kind}` · `POST /api/v1/data/demo` |
 | Workflows | `GET /api/v1/workflows/templates` · `POST /api/v1/workflows` · `POST /api/v1/workflows/{id}/run` |
 | Knowledge Graph | `POST /api/v1/knowledge-graph/query` · `POST /api/v1/knowledge-graph/hypotheses` |
 | Code | `POST /api/v1/code/generate` · `POST /api/v1/code/notebook` |
@@ -394,6 +467,8 @@ Full interactive documentation at `http://localhost:8000/docs` (Swagger UI).
 
 ## Supported Quantum Hardware
 
+Catalogue entries below are used for backend ranking and local noise emulation. Only IBM Quantum can receive real jobs, and only after opting in (see Quick Start).
+
 | Provider | Backend | Qubits | Type |
 |----------|---------|--------|------|
 | IBM Quantum | IBM Nairobi | 7 | Superconducting |
@@ -402,7 +477,8 @@ Full interactive documentation at `http://localhost:8000/docs` (Swagger UI).
 | IonQ | Aria | 25 | Trapped ion |
 | Quantinuum | H2 | 56 | Trapped ion |
 | Rigetti | Ankaa-3 | 84 | Superconducting |
-| Simulator | Qiskit Aer | 32 | Classical simulation |
+| Simulator | Local NumPy state vector (default) | 24 | Classical simulation |
+| Simulator | Qiskit Aer (optional) | 32 | Classical simulation |
 
 ---
 
@@ -433,13 +509,13 @@ WORKFLOW_TEMPLATES["my_workflow"] = {
 }
 ```
 
-**Connect real quantum hardware:**
+**Connect real quantum hardware (IBM Quantum only, opt-in, may be billed):**
 ```bash
-# .env
-IBM_QUANTUM_TOKEN=your_ibm_quantum_api_token
-IONQ_API_KEY=your_ionq_key
-QUANTINUUM_API_KEY=your_quantinuum_key
+# .env  (see .env.example)
+QUANTUMAGENT_ENABLE_CLOUD=true
+IBM_QUANTUM_TOKEN=<your token>
 ```
+Other providers need a `CloudAdapter` subclass in `backend/quantum/cloud.py`.
 
 ---
 
